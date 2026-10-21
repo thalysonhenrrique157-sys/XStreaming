@@ -16,9 +16,14 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.UiThreadUtil;
 
+import android.os.Environment;
+
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class FrameGenAssetModule extends ReactContextBaseJavaModule {
     private static final int IMPORT_REQUEST_CODE = 7312;
@@ -70,6 +75,11 @@ public final class FrameGenAssetModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void getImportFolder(Promise promise) {
+        promise.resolve(getPrimaryImportFolder());
+    }
+
+    @ReactMethod
     public void importLosslessDll(Promise promise) {
         Activity activity = getCurrentActivity();
         if (activity == null || activity.isFinishing()) {
@@ -80,6 +90,11 @@ public final class FrameGenAssetModule extends ReactContextBaseJavaModule {
             promise.reject("IMPORT_IN_PROGRESS", "A DLL import is already in progress");
             return;
         }
+        File found = findDllInKnownFolders();
+        if (found != null) {
+            new Thread(() -> importDllFromFile(found, promise), "xstreaming-dll-auto-import").start();
+            return;
+        }
         importPromise = promise;
         try {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -88,7 +103,11 @@ public final class FrameGenAssetModule extends ReactContextBaseJavaModule {
             activity.startActivityForResult(intent, IMPORT_REQUEST_CODE);
         } catch (Exception e) {
             importPromise = null;
-            promise.reject("OPEN_DOCUMENT_FAILED", e.getMessage(), e);
+            promise.reject(
+                    "OPEN_DOCUMENT_FAILED",
+                    "Lossless.dll not found. Place it in: " + getPrimaryImportFolder()
+                            + " (no file picker available on this device)",
+                    e);
         }
     }
 
@@ -121,6 +140,93 @@ public final class FrameGenAssetModule extends ReactContextBaseJavaModule {
                 throw new IllegalArgumentException("Selected DLL is empty");
             }
             File backup = new File(destination.getParentFile(), DLL_FILENAME + ".previous");
+            if (backup.exists() && !backup.delete()) {
+                throw new IllegalStateException("Unable to clean previous DLL backup");
+            }
+            boolean hadDestination = destination.exists();
+            if (hadDestination && !destination.renameTo(backup)) {
+                throw new IllegalStateException("Unable to stage existing DLL");
+            }
+            if (!temporary.renameTo(destination)) {
+                if (hadDestination) {
+                    //noinspection ResultOfMethodCallIgnored
+                    backup.renameTo(destination);
+                }
+                throw new IllegalStateException("Unable to store imported DLL");
+            }
+            if (backup.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                backup.delete();
+            }
+            clearShaderCache();
+            UiThreadUtil.runOnUiThread(() -> promise.resolve(true));
+        } catch (Exception e) {
+            //noinspection ResultOfMethodCallIgnored
+            temporary.delete();
+            UiThreadUtil.runOnUiThread(() ->
+                    promise.reject("DLL_IMPORT_FAILED", e.getMessage(), e));
+        }
+    }
+
+    /** Pasta recomendada: /sdcard/Android/data/<pacote>/files/ (não exige permissão extra). */
+    private String getPrimaryImportFolder() {
+        File dir = reactContext.getExternalFilesDir(null);
+        return dir != null ? dir.getAbsolutePath() : "Android/data/" + reactContext.getPackageName() + "/files";
+    }
+
+    private File findDllInKnownFolders() {
+        List<File> folders = new ArrayList<>();
+        File[] appDirs = reactContext.getExternalFilesDirs(null);
+        if (appDirs != null) {
+            for (File dir : appDirs) {
+                if (dir != null) {
+                    folders.add(dir);
+                }
+            }
+        }
+        folders.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS));
+        folders.add(Environment.getExternalStorageDirectory());
+        for (File folder : folders) {
+            if (folder == null) {
+                continue;
+            }
+            File[] files = folder.listFiles();
+            if (files == null) {
+                continue;
+            }
+            for (File candidate : files) {
+                if (candidate.isFile()
+                        && candidate.length() > 0
+                        && DLL_FILENAME.equalsIgnoreCase(candidate.getName())
+                        && candidate.canRead()) {
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    private void importDllFromFile(File source, Promise promise) {
+        File destination = getDllFile();
+        File temporary = new File(destination.getParentFile(), DLL_FILENAME + ".importing");
+        try {
+            File parent = destination.getParentFile();
+            if (!parent.isDirectory() && !parent.mkdirs()) {
+                throw new IllegalStateException("Unable to create private frame generation directory");
+            }
+            try (InputStream input = new FileInputStream(source);
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                }
+                output.getFD().sync();
+            }
+            if (temporary.length() == 0) {
+                throw new IllegalArgumentException("Selected DLL is empty");
+            }
+            File backup = new File(parent, DLL_FILENAME + ".previous");
             if (backup.exists() && !backup.delete()) {
                 throw new IllegalStateException("Unable to clean previous DLL backup");
             }
